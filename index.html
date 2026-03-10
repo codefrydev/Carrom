@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>2D Carrom Game - Physics Engine</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Include Matter.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <style>
+        body {
+            overscroll-behavior: none;
+            touch-action: none; /* Prevents pull-to-refresh and swiping on mobile */
+        }
+        #game-canvas {
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            background-color: #e5c185; /* Wood color */
+            border-radius: 8px;
+            width: 100%;
+            max-width: 600px;
+            aspect-ratio: 1 / 1;
+        }
+    </style>
+</head>
+<body class="min-h-screen bg-gray-900 flex flex-col items-center justify-center p-2 md:p-4 font-sans text-white">
+
+    <div class="w-full max-w-[600px] flex flex-col gap-4">
+        <!-- Header / HUD -->
+        <div class="flex justify-between items-center bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700">
+            <div class="flex flex-col items-center w-1/3">
+                <span class="text-gray-400 text-xs uppercase tracking-widest mb-1">White</span>
+                <div class="flex items-center gap-2">
+                    <div class="w-4 h-4 rounded-full bg-white shadow-sm"></div>
+                    <span id="score-white" class="text-2xl font-bold">0</span>
+                </div>
+            </div>
+            
+            <div class="flex flex-col items-center w-1/3 border-x border-gray-700">
+                <span class="text-gray-400 text-xs uppercase tracking-widest mb-1">Turn</span>
+                <span id="turn-indicator" class="text-sm font-bold text-white bg-gray-600 px-3 py-1 rounded-full">White</span>
+            </div>
+
+            <div class="flex flex-col items-center w-1/3">
+                <span class="text-gray-400 text-xs uppercase tracking-widest mb-1">Black</span>
+                <div class="flex items-center gap-2">
+                    <span id="score-black" class="text-2xl font-bold">0</span>
+                    <div class="w-4 h-4 rounded-full bg-black shadow-sm border border-gray-600"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Game Area -->
+        <div class="relative w-full flex justify-center">
+            <canvas id="game-canvas" width="1000" height="1000"></canvas>
+            
+            <!-- Messages Overlay -->
+            <div id="message-overlay" class="absolute inset-0 flex items-center justify-center pointer-events-none opacity-0 transition-opacity duration-300 z-10">
+                <div class="bg-black/80 px-8 py-4 rounded-full text-2xl font-bold tracking-wider backdrop-blur-sm" id="message-text">
+                    Foul!
+                </div>
+            </div>
+        </div>
+
+        <!-- Controls / Instructions -->
+        <div class="bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700">
+            <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-3">
+                <h3 class="font-bold text-yellow-500">How to Play</h3>
+                <div class="flex flex-wrap items-center gap-2">
+                    <div class="flex items-center gap-2 bg-gray-700 px-2 py-1 rounded" title="Adjust base striker strength">
+                        <label for="power-input" class="text-xs font-bold text-gray-300 uppercase tracking-wider">Power</label>
+                        <input type="number" id="power-input" value="4" min="1" max="20" step="1" class="w-12 px-1 py-0.5 rounded text-black font-bold text-sm text-center focus:outline-none focus:ring-2 focus:ring-yellow-500">
+                    </div>
+                    <button id="mode-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-1 px-3 rounded transition-colors">
+                        Mode: Vs Bot
+                    </button>
+                    <button id="reset-btn" class="bg-red-600 hover:bg-red-700 text-white text-sm font-bold py-1 px-3 rounded transition-colors">
+                        Reset
+                    </button>
+                </div>
+            </div>
+            <ul class="text-sm text-gray-300 space-y-1 list-disc pl-5">
+                <li><strong class="text-white">Slide:</strong> Drag the striker left/right along the baseline.</li>
+                <li><strong class="text-white">Shoot:</strong> Touch the striker, pull back to aim. The further you pull, the stronger the shot (up to 100% Power).</li>
+                <li><strong class="text-white">Bot:</strong> In Vs Bot mode, the AI plays the Black coins automatically!</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // --- Matter.js Aliases ---
+        const Engine = Matter.Engine,
+              Render = Matter.Render,
+              Runner = Matter.Runner,
+              Bodies = Matter.Bodies,
+              Composite = Matter.Composite,
+              Events = Matter.Events,
+              Vector = Matter.Vector,
+              Body = Matter.Body;
+
+        // --- Game Constants ---
+        const canvas = document.getElementById('game-canvas');
+        const ctx = canvas.getContext('2d');
+        const BOARD_SIZE = 1000;
+        
+        const POCKET_RADIUS = 45;
+        const COIN_RADIUS = 22;
+        const STRIKER_RADIUS = 30;
+        const BOARD_MARGIN = 60;
+        
+        // Physics Tuning
+        const FRICTION_AIR = 0.015;  
+        const RESTITUTION = 0.85;    
+        const WALL_RESTITUTION = 0.6;
+        const MAX_PULL_DIST = 250;
+        let FORCE_MULTIPLIER = 0.0004; // Changed to 'let' so it can be updated by the user
+
+        // UI Elements
+        const scoreWhiteEl = document.getElementById('score-white');
+        const scoreBlackEl = document.getElementById('score-black');
+        const turnIndicatorEl = document.getElementById('turn-indicator');
+        const messageOverlay = document.getElementById('message-overlay');
+        const messageText = document.getElementById('message-text');
+        const modeBtn = document.getElementById('mode-btn');
+        const powerInput = document.getElementById('power-input');
+
+        // --- Game State ---
+        let engine, runner;
+        let strikerBody = null;
+        let state = 'IDLE'; // IDLE, PLACING, AIMING, MOVING
+        let turn = 'White';
+        let scores = { White: 0, Black: 0, Red: 0 };
+        let gameMode = 'PvB'; // 'PvP' (Player vs Player) or 'PvB' (Player vs Bot)
+        
+        let dragStart = null;
+        let dragCurrent = null;
+        let pocketedThisTurn = { White: 0, Black: 0, Red: 0, Striker: false };
+        let botTimeout = null;
+        
+        const baselines = {
+            bottom: { y: BOARD_SIZE - 180, minX: 230, maxX: BOARD_SIZE - 230 },
+            top: { y: 180, minX: 230, maxX: BOARD_SIZE - 230 }
+        };
+
+        // --- Setup Matter.js Engine ---
+        function initEngine() {
+            engine = Engine.create({
+                positionIterations: 10,
+                velocityIterations: 10
+            });
+            engine.gravity.y = 0; 
+            engine.gravity.x = 0;
+
+            const wallOptions = { isStatic: true, restitution: WALL_RESTITUTION, friction: 0.1, renderType: 'Wall' };
+            const t = 100; 
+            Composite.add(engine.world, [
+                Bodies.rectangle(BOARD_SIZE/2, BOARD_MARGIN - t/2, BOARD_SIZE, t, wallOptions),
+                Bodies.rectangle(BOARD_SIZE/2, BOARD_SIZE - BOARD_MARGIN + t/2, BOARD_SIZE, t, wallOptions),
+                Bodies.rectangle(BOARD_MARGIN - t/2, BOARD_SIZE/2, t, BOARD_SIZE, wallOptions),
+                Bodies.rectangle(BOARD_SIZE - BOARD_MARGIN + t/2, BOARD_SIZE/2, t, BOARD_SIZE, wallOptions)
+            ]);
+
+            const pocketOptions = { isStatic: true, isSensor: true, renderType: 'Pocket' };
+            Composite.add(engine.world, [
+                Bodies.circle(BOARD_MARGIN, BOARD_MARGIN, POCKET_RADIUS, pocketOptions),
+                Bodies.circle(BOARD_SIZE - BOARD_MARGIN, BOARD_MARGIN, POCKET_RADIUS, pocketOptions),
+                Bodies.circle(BOARD_MARGIN, BOARD_SIZE - BOARD_MARGIN, POCKET_RADIUS, pocketOptions),
+                Bodies.circle(BOARD_SIZE - BOARD_MARGIN, BOARD_SIZE - BOARD_MARGIN, POCKET_RADIUS, pocketOptions)
+            ]);
+
+            Events.on(engine, 'collisionStart', handleCollisions);
+
+            runner = Runner.create();
+            Runner.run(runner, engine);
+        }
+
+        // --- Game Logic Functions ---
+        function initBoard() {
+            clearTimeout(botTimeout);
+            const bodiesToRemove = Composite.allBodies(engine.world).filter(b => 
+                ['White', 'Black', 'Red', 'Striker'].includes(b.renderType)
+            );
+            Composite.remove(engine.world, bodiesToRemove);
+
+            let cx = BOARD_SIZE / 2;
+            let cy = BOARD_SIZE / 2;
+            let r = COIN_RADIUS * 2.15;
+
+            const commonOptions = {
+                restitution: RESTITUTION,
+                frictionAir: FRICTION_AIR,
+                friction: 0.05,
+                density: 0.001
+            };
+
+            Composite.add(engine.world, Bodies.circle(cx, cy, COIN_RADIUS, { ...commonOptions, renderType: 'Red' }));
+
+            for (let i = 0; i < 6; i++) {
+                let angle = i * (Math.PI / 3);
+                Composite.add(engine.world, Bodies.circle(
+                    cx + Math.cos(angle) * r, cy + Math.sin(angle) * r, 
+                    COIN_RADIUS, { ...commonOptions, renderType: i % 2 === 0 ? 'White' : 'Black' }
+                ));
+            }
+
+            for (let i = 0; i < 12; i++) {
+                let angle = i * (Math.PI / 6);
+                let dist = (i % 2 === 0) ? r * 2 : r * Math.sqrt(3);
+                Composite.add(engine.world, Bodies.circle(
+                    cx + Math.cos(angle) * dist, cy + Math.sin(angle) * dist, 
+                    COIN_RADIUS, { ...commonOptions, renderType: i % 2 === 0 ? 'Black' : 'White' }
+                ));
+            }
+
+            resetStriker();
+            updateUI();
+        }
+
+        function resetStriker() {
+            if (strikerBody) {
+                Composite.remove(engine.world, strikerBody);
+            }
+
+            let yPos = turn === 'White' ? baselines.bottom.y : baselines.top.y;
+            strikerBody = Bodies.circle(BOARD_SIZE / 2, yPos, STRIKER_RADIUS, {
+                restitution: RESTITUTION,
+                frictionAir: FRICTION_AIR,
+                friction: 0.05,
+                density: 0.003,
+                renderType: 'Striker'
+            });
+            Composite.add(engine.world, strikerBody);
+            state = 'IDLE';
+            pocketedThisTurn = { White: 0, Black: 0, Red: 0, Striker: false };
+        }
+
+        function handleCollisions(event) {
+            const pairs = event.pairs;
+            for (let i = 0; i < pairs.length; i++) {
+                const bodyA = pairs[i].bodyA;
+                const bodyB = pairs[i].bodyB;
+
+                if ((bodyA.isSensor && !bodyB.isSensor) || (!bodyA.isSensor && bodyB.isSensor)) {
+                    const piece = bodyA.isSensor ? bodyB : bodyA;
+                    if (['White', 'Black', 'Red', 'Striker'].includes(piece.renderType)) {
+                        pocketPiece(piece);
+                    }
+                }
+            }
+        }
+
+        function pocketPiece(piece) {
+            Composite.remove(engine.world, piece);
+            if (piece.renderType === 'Striker') {
+                pocketedThisTurn.Striker = true;
+            } else {
+                pocketedThisTurn[piece.renderType]++;
+            }
+        }
+
+        function evaluateTurnEnd() {
+            if (pocketedThisTurn.Striker) {
+                showMessage("Foul! Striker Pocketed.");
+                scores[turn] = Math.max(0, scores[turn] - 1);
+            } else if (pocketedThisTurn.White > 0 || pocketedThisTurn.Black > 0 || pocketedThisTurn.Red > 0) {
+                scores.White += pocketedThisTurn.White;
+                scores.Black += pocketedThisTurn.Black;
+                if (pocketedThisTurn.Red > 0) {
+                    scores[turn] += 3;
+                    showMessage("Queen Pocketed!");
+                }
+            }
+
+            let ownPocketed = turn === 'White' ? pocketedThisTurn.White : pocketedThisTurn.Black;
+            if (ownPocketed === 0 && !pocketedThisTurn.Red && !pocketedThisTurn.Striker) {
+                turn = turn === 'White' ? 'Black' : 'White';
+            }
+
+            updateUI();
+            resetStriker();
+
+            // Trigger Bot turn if applicable
+            if (gameMode === 'PvB' && turn === 'Black') {
+                botTimeout = setTimeout(playBotTurn, 1000);
+            }
+        }
+
+        // --- Bot AI Logic ---
+        function playBotTurn() {
+            if (state !== 'IDLE' || turn !== 'Black') return;
+            
+            // Find all valid targets (Black coins and Red Queen)
+            const bodies = Composite.allBodies(engine.world);
+            let targets = bodies.filter(b => b.renderType === 'Black' || b.renderType === 'Red');
+            
+            if (targets.length === 0) return; // No targets left
+            
+            // Make Bot slightly smart: target the coin closest to a bottom pocket
+            targets.sort((a, b) => {
+                let distA = Math.min(
+                    Math.hypot(a.position.x - BOARD_MARGIN, a.position.y - (BOARD_SIZE - BOARD_MARGIN)),
+                    Math.hypot(a.position.x - (BOARD_SIZE - BOARD_MARGIN), a.position.y - (BOARD_SIZE - BOARD_MARGIN))
+                );
+                let distB = Math.min(
+                    Math.hypot(b.position.x - BOARD_MARGIN, b.position.y - (BOARD_SIZE - BOARD_MARGIN)),
+                    Math.hypot(b.position.x - (BOARD_SIZE - BOARD_MARGIN), b.position.y - (BOARD_SIZE - BOARD_MARGIN))
+                );
+                return distA - distB;
+            });
+            
+            const target = targets[0]; 
+            
+            // Align striker loosely with the target
+            let targetX = target.position.x + (Math.random() - 0.5) * 50; // add slight imperfection
+            let startX = Math.max(baselines.top.minX, Math.min(baselines.top.maxX, targetX));
+            
+            Body.setPosition(strikerBody, { x: startX, y: baselines.top.y });
+            Body.setVelocity(strikerBody, { x: 0, y: 0 });
+            
+            // Calculate aim vector
+            let dx = target.position.x - startX;
+            let dy = target.position.y - baselines.top.y;
+            let dist = Math.hypot(dx, dy);
+            
+            let dirX = dx / dist;
+            let dirY = dy / dist;
+            
+            // Randomize Bot shot power (between 50% and 100%)
+            let powerRatio = 0.5 + Math.random() * 0.5;
+            let forceMag = (MAX_PULL_DIST * powerRatio) * FORCE_MULTIPLIER;
+            
+            // Simulate dragging for the UI (so the player sees the bot aim)
+            state = 'AIMING';
+            dragStart = { x: startX, y: baselines.top.y };
+            let dragPull = MAX_PULL_DIST * powerRatio;
+            dragCurrent = { 
+                x: startX - dirX * dragPull, 
+                y: baselines.top.y - dirY * dragPull 
+            };
+            
+            // Wait shortly to display aim, then shoot
+            botTimeout = setTimeout(() => {
+                Body.applyForce(strikerBody, strikerBody.position, {
+                    x: dirX * forceMag,
+                    y: dirY * forceMag
+                });
+                state = 'MOVING';
+                dragStart = null;
+                dragCurrent = null;
+            }, 800);
+        }
+
+        function showMessage(msg) {
+            messageText.innerText = msg;
+            messageOverlay.classList.remove('opacity-0');
+            setTimeout(() => {
+                messageOverlay.classList.add('opacity-0');
+            }, 2000);
+        }
+
+        function updateUI() {
+            scoreWhiteEl.innerText = scores.White;
+            scoreBlackEl.innerText = scores.Black;
+            
+            modeBtn.innerText = gameMode === 'PvB' ? 'Mode: Vs Bot' : 'Mode: PvP';
+
+            turnIndicatorEl.innerText = turn;
+            if (turn === 'White') {
+                turnIndicatorEl.className = "text-sm font-bold text-black bg-white px-4 py-1 rounded-full shadow-md";
+            } else {
+                turnIndicatorEl.className = "text-sm font-bold text-white bg-black px-4 py-1 rounded-full shadow-md border border-gray-600";
+            }
+        }
+
+        // --- Custom Canvas Rendering Engine ---
+        function drawBoard() {
+            ctx.clearRect(0, 0, BOARD_SIZE, BOARD_SIZE);
+
+            ctx.fillStyle = '#3e2723';
+            ctx.fillRect(0, 0, BOARD_SIZE, BOARD_SIZE);
+            
+            ctx.fillStyle = '#e5c185';
+            ctx.fillRect(30, 30, BOARD_SIZE - 60, BOARD_SIZE - 60);
+
+            ctx.strokeStyle = '#3e2723';
+            ctx.lineWidth = 3;
+
+            ctx.beginPath();
+            ctx.moveTo(120, 120); ctx.lineTo(250, 250);
+            ctx.moveTo(BOARD_SIZE-120, 120); ctx.lineTo(BOARD_SIZE-250, 250);
+            ctx.moveTo(120, BOARD_SIZE-120); ctx.lineTo(250, BOARD_SIZE-250);
+            ctx.moveTo(BOARD_SIZE-120, BOARD_SIZE-120); ctx.lineTo(BOARD_SIZE-250, BOARD_SIZE-250);
+            ctx.stroke();
+
+            let cx = BOARD_SIZE / 2, cy = BOARD_SIZE / 2;
+            ctx.beginPath(); ctx.arc(cx, cy, 80, 0, Math.PI * 2); ctx.stroke();
+            ctx.beginPath(); ctx.arc(cx, cy, 10, 0, Math.PI * 2); ctx.fillStyle = '#e53935'; ctx.fill(); ctx.stroke();
+            
+            ctx.beginPath(); ctx.arc(cx, cy, 95, 0, Math.PI * 2); ctx.lineWidth = 1; ctx.stroke(); ctx.lineWidth = 3;
+
+            const drawBaseline = (x, y, w, h) => {
+                ctx.strokeRect(x, y, w, h);
+                ctx.beginPath(); ctx.arc(x, y + h/2, 20, 0, Math.PI*2); ctx.fillStyle = '#e53935'; ctx.fill(); ctx.stroke();
+                ctx.beginPath(); ctx.arc(x + w, y + h/2, 20, 0, Math.PI*2); ctx.fillStyle = '#e53935'; ctx.fill(); ctx.stroke();
+            };
+
+            drawBaseline(230, baselines.bottom.y - 15, BOARD_SIZE - 460, 30);
+            drawBaseline(230, baselines.top.y - 15, BOARD_SIZE - 460, 30);
+            drawBaseline(180 - 15, 230, 30, BOARD_SIZE - 460);
+            drawBaseline(BOARD_SIZE - 180 - 15, 230, 30, BOARD_SIZE - 460);
+
+            ctx.fillStyle = '#111';
+            const pockets = [
+                {x: BOARD_MARGIN, y: BOARD_MARGIN},
+                {x: BOARD_SIZE - BOARD_MARGIN, y: BOARD_MARGIN},
+                {x: BOARD_MARGIN, y: BOARD_SIZE - BOARD_MARGIN},
+                {x: BOARD_SIZE - BOARD_MARGIN, y: BOARD_SIZE - BOARD_MARGIN}
+            ];
+            for (let p of pockets) {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, POCKET_RADIUS, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.lineWidth = 4;
+                ctx.strokeStyle = '#5d4037';
+                ctx.stroke();
+            }
+        }
+
+        function drawEntity(body) {
+            const pos = body.position;
+            const r = body.circleRadius;
+            const type = body.renderType;
+
+            ctx.save();
+            ctx.translate(pos.x, pos.y);
+            ctx.rotate(body.angle);
+
+            ctx.beginPath();
+            ctx.arc(0, 0, r, 0, Math.PI * 2);
+
+            ctx.shadowColor = 'rgba(0,0,0,0.4)';
+            ctx.shadowBlur = 4;
+            ctx.shadowOffsetX = 2;
+            ctx.shadowOffsetY = 2;
+
+            if (type === 'White') {
+                ctx.fillStyle = '#f0f0f0'; ctx.fill();
+                ctx.lineWidth = 2; ctx.strokeStyle = '#d0d0d0'; ctx.stroke();
+                ctx.beginPath(); ctx.arc(0, 0, r*0.6, 0, Math.PI * 2); ctx.stroke();
+            } else if (type === 'Black') {
+                ctx.fillStyle = '#222'; ctx.fill();
+                ctx.lineWidth = 2; ctx.strokeStyle = '#000'; ctx.stroke();
+                ctx.beginPath(); ctx.arc(0, 0, r*0.6, 0, Math.PI * 2); ctx.strokeStyle='#444'; ctx.stroke();
+            } else if (type === 'Red') {
+                ctx.fillStyle = '#e53935'; ctx.fill();
+                ctx.lineWidth = 2; ctx.strokeStyle = '#b71c1c'; ctx.stroke();
+                ctx.beginPath(); ctx.arc(0, 0, r * 0.5, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.stroke();
+            } else if (type === 'Striker') {
+                ctx.fillStyle = '#e0f7fa'; ctx.fill();
+                ctx.lineWidth = 4; ctx.strokeStyle = '#006064'; ctx.stroke();
+                
+                ctx.beginPath(); ctx.arc(0, 0, r * 0.6, 0, Math.PI * 2);
+                ctx.strokeStyle = '#00acc1'; ctx.stroke();
+                ctx.beginPath(); ctx.arc(0, 0, r * 0.2, 0, Math.PI * 2);
+                ctx.fillStyle = '#00acc1'; ctx.fill();
+            }
+
+            ctx.restore();
+        }
+
+        function drawAimLine() {
+            if (state === 'AIMING' && dragStart && dragCurrent) {
+                let dx = dragCurrent.x - dragStart.x;
+                let dy = dragCurrent.y - dragStart.y;
+                let dragMag = Math.sqrt(dx*dx + dy*dy);
+                
+                let powerRatio = Math.min(dragMag / MAX_PULL_DIST, 1);
+                
+                let dirX = -dx / (dragMag || 1);
+                let dirY = -dy / (dragMag || 1);
+                
+                ctx.beginPath();
+                ctx.moveTo(strikerBody.position.x, strikerBody.position.y);
+                
+                let aimX = strikerBody.position.x + dirX * (150 + powerRatio * 150);
+                let aimY = strikerBody.position.y + dirY * (150 + powerRatio * 150);
+                
+                ctx.lineTo(aimX, aimY);
+                
+                let rColor = Math.floor(255 * powerRatio);
+                let gColor = Math.floor(255 * (1 - powerRatio));
+                ctx.strokeStyle = `rgba(${rColor}, ${gColor}, 0, 0.7)`;
+                ctx.lineWidth = 4 + (powerRatio * 4);
+                ctx.setLineDash([10, 10]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                ctx.beginPath();
+                ctx.arc(aimX, aimY, 6, 0, Math.PI * 2);
+                ctx.fillStyle = ctx.strokeStyle;
+                ctx.fill();
+
+                // Draw explicit Power Text indicator
+                ctx.font = "bold 24px sans-serif";
+                ctx.fillStyle = `rgb(${rColor}, ${gColor}, 0)`;
+                ctx.fillText(`${Math.round(powerRatio * 100)}% Power`, aimX + 20, aimY + 10);
+            }
+        }
+
+        function render() {
+            drawBoard();
+            
+            const bodies = Composite.allBodies(engine.world);
+            for (let b of bodies) {
+                if (['White', 'Black', 'Red', 'Striker'].includes(b.renderType)) {
+                    drawEntity(b);
+                }
+            }
+            
+            drawAimLine();
+
+            if (state === 'MOVING') {
+                let isMoving = false;
+                for (let b of bodies) {
+                    if (['White', 'Black', 'Red', 'Striker'].includes(b.renderType)) {
+                        if (b.speed > 0.05) {
+                            isMoving = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!isMoving) {
+                    state = 'IDLE';
+                    evaluateTurnEnd();
+                }
+            }
+
+            requestAnimationFrame(render);
+        }
+
+        // --- Input Handling ---
+        function getMousePos(e) {
+            let rect = canvas.getBoundingClientRect();
+            let clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            let clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            
+            let scaleX = canvas.width / rect.width;
+            let scaleY = canvas.height / rect.height;
+
+            return {
+                x: (clientX - rect.left) * scaleX,
+                y: (clientY - rect.top) * scaleY
+            };
+        }
+
+        function isPlayerTurnLocked() {
+            return gameMode === 'PvB' && turn === 'Black';
+        }
+
+        function onDown(e) {
+            e.preventDefault();
+            if (state !== 'IDLE' || !strikerBody || isPlayerTurnLocked()) return;
+
+            let pos = getMousePos(e);
+            let distToStriker = Math.hypot(pos.x - strikerBody.position.x, pos.y - strikerBody.position.y);
+
+            if (distToStriker <= STRIKER_RADIUS + 20) {
+                state = 'AIMING';
+                dragStart = pos;
+                dragCurrent = pos;
+            } else {
+                let baseline = turn === 'White' ? baselines.bottom : baselines.top;
+                if (Math.abs(pos.y - baseline.y) < 50) {
+                    state = 'PLACING';
+                    let newX = Math.max(baseline.minX, Math.min(baseline.maxX, pos.x));
+                    Body.setPosition(strikerBody, { x: newX, y: baseline.y });
+                    Body.setVelocity(strikerBody, { x: 0, y: 0 });
+                }
+            }
+        }
+
+        function onMove(e) {
+            e.preventDefault();
+            if (isPlayerTurnLocked()) return;
+            
+            let pos = getMousePos(e);
+
+            if (state === 'AIMING') {
+                dragCurrent = pos;
+            } else if (state === 'PLACING' && strikerBody) {
+                let baseline = turn === 'White' ? baselines.bottom : baselines.top;
+                let newX = Math.max(baseline.minX, Math.min(baseline.maxX, pos.x));
+                Body.setPosition(strikerBody, { x: newX, y: baseline.y });
+            }
+        }
+
+        function onUp(e) {
+            e.preventDefault();
+            if (isPlayerTurnLocked()) return;
+            
+            if (state === 'AIMING' && dragStart && dragCurrent && strikerBody) {
+                let dx = dragCurrent.x - dragStart.x;
+                let dy = dragCurrent.y - dragStart.y;
+                let dist = Math.hypot(dx, dy);
+                
+                if (dist > 10) { 
+                    let forceMag = Math.min(dist, MAX_PULL_DIST) * FORCE_MULTIPLIER;
+                    let dirX = -dx / dist;
+                    let dirY = -dy / dist;
+                    
+                    Body.applyForce(strikerBody, strikerBody.position, {
+                        x: dirX * forceMag,
+                        y: dirY * forceMag
+                    });
+                    
+                    state = 'MOVING';
+                } else {
+                    state = 'IDLE'; 
+                }
+            } else if (state === 'PLACING') {
+                state = 'IDLE';
+            }
+            
+            dragStart = null;
+            dragCurrent = null;
+        }
+
+        // Event Listeners
+        canvas.addEventListener('mousedown', onDown, {passive: false});
+        canvas.addEventListener('mousemove', onMove, {passive: false});
+        window.addEventListener('mouseup', onUp, {passive: false});
+
+        canvas.addEventListener('touchstart', onDown, {passive: false});
+        canvas.addEventListener('touchmove', onMove, {passive: false});
+        window.addEventListener('touchend', onUp, {passive: false});
+
+        document.getElementById('reset-btn').addEventListener('click', () => {
+            scores = { White: 0, Black: 0, Red: 0 };
+            turn = 'White';
+            initBoard();
+        });
+
+        modeBtn.addEventListener('click', () => {
+            gameMode = gameMode === 'PvB' ? 'PvP' : 'PvB';
+            scores = { White: 0, Black: 0, Red: 0 };
+            turn = 'White';
+            initBoard();
+        });
+
+        // Listen for power changes
+        powerInput.addEventListener('input', (e) => {
+            let val = parseFloat(e.target.value);
+            if (isNaN(val) || val <= 0) val = 1; // Minimum safeguard
+            
+            // Map the UI value (e.g., 4) to the physics engine multiplier (0.0004)
+            FORCE_MULTIPLIER = val * 0.0001; 
+        });
+
+        // Initialize and start loop
+        initEngine();
+        initBoard();
+        render(); 
+
+    </script>
+</body>
+</html>
