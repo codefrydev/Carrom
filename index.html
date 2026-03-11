@@ -26,7 +26,7 @@
 
     <div class="w-full max-w-[600px] flex flex-col gap-4">
         <!-- Header / HUD -->
-        <div class="flex justify-between items-center bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700">
+        <div class="flex justify-between items-center bg-gray-800 p-4 rounded-xl shadow-lg border border-gray-700" aria-live="polite" aria-atomic="true">
             <div class="flex flex-col items-center w-1/3">
                 <span class="text-gray-400 text-xs uppercase tracking-widest mb-1">White</span>
                 <div class="flex items-center gap-2">
@@ -51,7 +51,7 @@
 
         <!-- Game Area -->
         <div class="relative w-full flex justify-center">
-            <canvas id="game-canvas" width="1000" height="1000"></canvas>
+            <canvas id="game-canvas" width="1000" height="1000" role="img" aria-label="Carrom board with pieces"></canvas>
             
             <!-- Messages Overlay -->
             <div id="message-overlay" class="absolute inset-0 flex items-center justify-center pointer-events-none opacity-0 transition-opacity duration-300 z-10">
@@ -68,12 +68,12 @@
                 <div class="flex flex-wrap items-center gap-2">
                     <div class="flex items-center gap-2 bg-gray-700 px-2 py-1 rounded" title="Adjust base striker strength">
                         <label for="power-input" class="text-xs font-bold text-gray-300 uppercase tracking-wider">Power</label>
-                        <input type="number" id="power-input" value="4" min="1" max="20" step="1" class="w-12 px-1 py-0.5 rounded text-black font-bold text-sm text-center focus:outline-none focus:ring-2 focus:ring-yellow-500">
+                        <input type="number" id="power-input" value="50" min="1" max="1000" step="1" class="w-16 px-1 py-0.5 rounded text-black font-bold text-sm text-center focus:outline-none focus:ring-2 focus:ring-yellow-500">
                     </div>
-                    <button id="mode-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-1 px-3 rounded transition-colors">
+                    <button id="mode-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-1 px-3 rounded transition-colors" aria-label="Toggle game mode: versus bot or versus player">
                         Mode: Vs Bot
                     </button>
-                    <button id="reset-btn" class="bg-red-600 hover:bg-red-700 text-white text-sm font-bold py-1 px-3 rounded transition-colors">
+                    <button id="reset-btn" class="bg-red-600 hover:bg-red-700 text-white text-sm font-bold py-1 px-3 rounded transition-colors" aria-label="Reset game">
                         Reset
                     </button>
                 </div>
@@ -81,7 +81,9 @@
             <ul class="text-sm text-gray-300 space-y-1 list-disc pl-5">
                 <li><strong class="text-white">Slide:</strong> Drag the striker left/right along the baseline.</li>
                 <li><strong class="text-white">Shoot:</strong> Touch the striker, pull back to aim. The further you pull, the stronger the shot (up to 100% Power).</li>
-                <li><strong class="text-white">Bot:</strong> In Vs Bot mode, the AI plays the Black coins automatically!</li>
+                <li><strong class="text-white">Queen (red):</strong> Pocket the queen, then pocket one of your color on the same or next shot to "cover" it (+3 points). If you don't cover, the queen returns to center.</li>
+                <li><strong class="text-white">Striker foul:</strong> If you pocket the striker, one of your pocketed pieces returns to center (or you "owe" one on your next pocket).</li>
+                <li><strong class="text-white">Bot:</strong> In Vs Bot mode, the AI plays the Black coins automatically. First to 25 points wins!</li>
             </ul>
         </div>
     </div>
@@ -100,6 +102,22 @@
         // --- Game Constants ---
         const canvas = document.getElementById('game-canvas');
         const ctx = canvas.getContext('2d');
+        if (!ctx) {
+            const container = canvas.parentElement;
+            if (container) {
+                const msg = document.createElement('p');
+                msg.className = 'text-red-400 font-bold text-center py-4';
+                msg.textContent = 'Canvas not supported in this browser.';
+                container.appendChild(msg);
+            }
+        }
+        if (typeof Matter === 'undefined' && canvas && canvas.parentElement) {
+            const msg = document.createElement('p');
+            msg.className = 'text-red-400 font-bold text-center py-4';
+            msg.textContent = 'Failed to load game engine (Matter.js).';
+            canvas.parentElement.appendChild(msg);
+        }
+        if (typeof Matter !== 'undefined') {
         const BOARD_SIZE = 1000;
         
         const POCKET_RADIUS = 45;
@@ -112,7 +130,13 @@
         const RESTITUTION = 0.85;    
         const WALL_RESTITUTION = 0.6;
         const MAX_PULL_DIST = 250;
-        let FORCE_MULTIPLIER = 0.0004; // Changed to 'let' so it can be updated by the user
+        let FORCE_MULTIPLIER = 0.005; // 50 * 0.0001; updated by power input (range 1–1000)
+        const SPEED_THRESHOLD = 0.05;
+        const STRIKER_HIT_MARGIN = 20;
+        const BASELINE_HIT_AREA = 50;
+        const MIN_DRAG_TO_SHOOT = 10;
+        const BOT_DELAY_AFTER_TURN = 1000;
+        const BOT_AIM_DISPLAY_MS = 800;
 
         // UI Elements
         const scoreWhiteEl = document.getElementById('score-white');
@@ -135,11 +159,16 @@
         let dragCurrent = null;
         let pocketedThisTurn = { White: 0, Black: 0, Red: 0, Striker: false };
         let botTimeout = null;
+        let queenPocketedBy = null;       // 'White' | 'Black' | null – queen awaiting cover
+        let totalPocketed = { White: 0, Black: 0 }; // pieces pocketed by each side (for striker foul return)
+        let oweOnePiece = { White: false, Black: false }; // striker foul with none pocketed yet
         
         const baselines = {
             bottom: { y: BOARD_SIZE - 180, minX: 230, maxX: BOARD_SIZE - 230 },
             top: { y: 180, minX: 230, maxX: BOARD_SIZE - 230 }
         };
+        function isGamePiece(b) { return b && ['White', 'Black', 'Red', 'Striker'].includes(b.renderType); }
+        function getBaseline() { return turn === 'White' ? baselines.bottom : baselines.top; }
 
         // --- Setup Matter.js Engine ---
         function initEngine() {
@@ -176,14 +205,17 @@
         // --- Game Logic Functions ---
         function initBoard() {
             clearTimeout(botTimeout);
-            const bodiesToRemove = Composite.allBodies(engine.world).filter(b => 
-                ['White', 'Black', 'Red', 'Striker'].includes(b.renderType)
-            );
+            queenPocketedBy = null;
+            totalPocketed = { White: 0, Black: 0 };
+            oweOnePiece = { White: false, Black: false };
+            const bodiesToRemove = Composite.allBodies(engine.world).filter(isGamePiece);
             Composite.remove(engine.world, bodiesToRemove);
 
             let cx = BOARD_SIZE / 2;
             let cy = BOARD_SIZE / 2;
-            let r = COIN_RADIUS * 2.15;
+            // Proper hexagonal layout: inner ring 6 coins, outer ring 12 on a circle (1 queen + 9 white + 9 black)
+            const innerRadius = COIN_RADIUS * 2.05;
+            const outerRadius = COIN_RADIUS * 4.1;
 
             const commonOptions = {
                 restitution: RESTITUTION,
@@ -195,18 +227,17 @@
             Composite.add(engine.world, Bodies.circle(cx, cy, COIN_RADIUS, { ...commonOptions, renderType: 'Red' }));
 
             for (let i = 0; i < 6; i++) {
-                let angle = i * (Math.PI / 3);
+                let angle = (i * Math.PI / 3);
                 Composite.add(engine.world, Bodies.circle(
-                    cx + Math.cos(angle) * r, cy + Math.sin(angle) * r, 
+                    cx + Math.cos(angle) * innerRadius, cy + Math.sin(angle) * innerRadius,
                     COIN_RADIUS, { ...commonOptions, renderType: i % 2 === 0 ? 'White' : 'Black' }
                 ));
             }
 
             for (let i = 0; i < 12; i++) {
-                let angle = i * (Math.PI / 6);
-                let dist = (i % 2 === 0) ? r * 2 : r * Math.sqrt(3);
+                let angle = (i * Math.PI / 6);
                 Composite.add(engine.world, Bodies.circle(
-                    cx + Math.cos(angle) * dist, cy + Math.sin(angle) * dist, 
+                    cx + Math.cos(angle) * outerRadius, cy + Math.sin(angle) * outerRadius,
                     COIN_RADIUS, { ...commonOptions, renderType: i % 2 === 0 ? 'Black' : 'White' }
                 ));
             }
@@ -215,12 +246,29 @@
             updateUI();
         }
 
+        function addPieceAtCenter(renderType) {
+            const cx = BOARD_SIZE / 2;
+            const cy = BOARD_SIZE / 2;
+            const commonOptions = {
+                restitution: RESTITUTION,
+                frictionAir: FRICTION_AIR,
+                friction: 0.05,
+                density: 0.001
+            };
+            const offset = COIN_RADIUS * 2.5;
+            const angle = Math.random() * Math.PI * 2;
+            const x = cx + Math.cos(angle) * offset;
+            const y = cy + Math.sin(angle) * offset;
+            const body = Bodies.circle(x, y, COIN_RADIUS, { ...commonOptions, renderType });
+            Composite.add(engine.world, body);
+        }
+
         function resetStriker() {
             if (strikerBody) {
                 Composite.remove(engine.world, strikerBody);
             }
 
-            let yPos = turn === 'White' ? baselines.bottom.y : baselines.top.y;
+            let yPos = getBaseline().y;
             strikerBody = Bodies.circle(BOARD_SIZE / 2, yPos, STRIKER_RADIUS, {
                 restitution: RESTITUTION,
                 frictionAir: FRICTION_AIR,
@@ -235,13 +283,15 @@
 
         function handleCollisions(event) {
             const pairs = event.pairs;
+            const pocketedIds = new Set();
             for (let i = 0; i < pairs.length; i++) {
                 const bodyA = pairs[i].bodyA;
                 const bodyB = pairs[i].bodyB;
 
                 if ((bodyA.isSensor && !bodyB.isSensor) || (!bodyA.isSensor && bodyB.isSensor)) {
                     const piece = bodyA.isSensor ? bodyB : bodyA;
-                    if (['White', 'Black', 'Red', 'Striker'].includes(piece.renderType)) {
+                    if (!pocketedIds.has(piece.id) && isGamePiece(piece)) {
+                        pocketedIds.add(piece.id);
                         pocketPiece(piece);
                     }
                 }
@@ -257,36 +307,79 @@
             }
         }
 
+        let evaluatingTurnEnd = false;
         function evaluateTurnEnd() {
-            if (pocketedThisTurn.Striker) {
-                showMessage("Foul! Striker Pocketed.");
-                scores[turn] = Math.max(0, scores[turn] - 1);
-            } else if (pocketedThisTurn.White > 0 || pocketedThisTurn.Black > 0 || pocketedThisTurn.Red > 0) {
-                scores.White += pocketedThisTurn.White;
-                scores.Black += pocketedThisTurn.Black;
-                if (pocketedThisTurn.Red > 0) {
+            if (evaluatingTurnEnd) return;
+            evaluatingTurnEnd = true;
+            let ownPocketed = turn === 'White' ? pocketedThisTurn.White : pocketedThisTurn.Black;
+            const hadQueenThisTurn = pocketedThisTurn.Red > 0;
+
+            // Queen cover: if this player had queen pending from a previous shot, they must cover this turn or queen returns
+            if (queenPocketedBy === turn) {
+                if (ownPocketed > 0) {
                     scores[turn] += 3;
-                    showMessage("Queen Pocketed!");
+                    showMessage("Queen Covered!");
+                    queenPocketedBy = null;
+                } else {
+                    addPieceAtCenter('Red');
+                    showMessage("Queen not covered – returned to center.");
+                    queenPocketedBy = null;
                 }
             }
 
-            let ownPocketed = turn === 'White' ? pocketedThisTurn.White : pocketedThisTurn.Black;
-            if (ownPocketed === 0 && !pocketedThisTurn.Red && !pocketedThisTurn.Striker) {
+            if (pocketedThisTurn.Striker) {
+                showMessage("Foul! Striker Pocketed.");
+                if (totalPocketed[turn] > 0) {
+                    totalPocketed[turn]--;
+                    addPieceAtCenter(turn === 'White' ? 'White' : 'Black');
+                } else {
+                    oweOnePiece[turn] = true;
+                }
+            } else {
+                // Queen pocketed this turn: covered in same shot if own piece also pocketed
+                if (hadQueenThisTurn) {
+                    if (ownPocketed > 0) {
+                        scores[turn] += 3;
+                        showMessage("Queen Covered!");
+                        queenPocketedBy = null;
+                    } else {
+                        queenPocketedBy = turn;
+                    }
+                }
+                // Points only for your own pocketed pieces; striker foul "owe one" means one goes back
+                const hadOwe = oweOnePiece[turn];
+                if (hadOwe && ownPocketed > 0) {
+                    addPieceAtCenter(turn === 'White' ? 'White' : 'Black');
+                    oweOnePiece[turn] = false;
+                    scores[turn] += Math.max(0, ownPocketed - 1);
+                    totalPocketed[turn] += ownPocketed - 1;
+                } else {
+                    scores[turn] += ownPocketed;
+                    totalPocketed[turn] += ownPocketed;
+                }
+            }
+
+            if (ownPocketed === 0 && !hadQueenThisTurn && !pocketedThisTurn.Striker) {
                 turn = turn === 'White' ? 'Black' : 'White';
             }
 
             updateUI();
+            const WIN_POINTS = 25;
+            if (scores.White >= WIN_POINTS || scores.Black >= WIN_POINTS) {
+                const winner = scores.White >= WIN_POINTS ? 'White' : 'Black';
+                showMessage(winner + ' wins! ' + WIN_POINTS + ' points.');
+            }
             resetStriker();
 
-            // Trigger Bot turn if applicable
             if (gameMode === 'PvB' && turn === 'Black') {
-                botTimeout = setTimeout(playBotTurn, 1000);
+                botTimeout = setTimeout(playBotTurn, BOT_DELAY_AFTER_TURN);
             }
+            evaluatingTurnEnd = false;
         }
 
         // --- Bot AI Logic ---
         function playBotTurn() {
-            if (state !== 'IDLE' || turn !== 'Black') return;
+            if (state !== 'IDLE' || turn !== 'Black' || !strikerBody) return;
             
             // Find all valid targets (Black coins and Red Queen)
             const bodies = Composite.allBodies(engine.world);
@@ -320,6 +413,7 @@
             let dx = target.position.x - startX;
             let dy = target.position.y - baselines.top.y;
             let dist = Math.hypot(dx, dy);
+            if (dist < 1e-6) return; // target on striker, skip shot
             
             let dirX = dx / dist;
             let dirY = dy / dist;
@@ -346,7 +440,7 @@
                 state = 'MOVING';
                 dragStart = null;
                 dragCurrent = null;
-            }, 800);
+            }, BOT_AIM_DISPLAY_MS);
         }
 
         function showMessage(msg) {
@@ -384,29 +478,63 @@
             ctx.strokeStyle = '#3e2723';
             ctx.lineWidth = 3;
 
+            const minX = baselines.bottom.minX, maxX = baselines.bottom.maxX;
+            const baseYTop = baselines.top.y, baseYBottom = baselines.bottom.y;
+            const baseXLeft = 180, baseXRight = BOARD_SIZE - 180;
+            const corner = BOARD_MARGIN;
+            const cornerFar = BOARD_SIZE - BOARD_MARGIN;
+            // Diagonal lines from baseline ends toward corner pockets
             ctx.beginPath();
-            ctx.moveTo(120, 120); ctx.lineTo(250, 250);
-            ctx.moveTo(BOARD_SIZE-120, 120); ctx.lineTo(BOARD_SIZE-250, 250);
-            ctx.moveTo(120, BOARD_SIZE-120); ctx.lineTo(250, BOARD_SIZE-250);
-            ctx.moveTo(BOARD_SIZE-120, BOARD_SIZE-120); ctx.lineTo(BOARD_SIZE-250, BOARD_SIZE-250);
+            ctx.moveTo(minX, baseYBottom); ctx.lineTo(corner, cornerFar);
+            ctx.moveTo(maxX, baseYBottom); ctx.lineTo(cornerFar, cornerFar);
+            ctx.moveTo(minX, baseYTop); ctx.lineTo(corner, corner);
+            ctx.moveTo(maxX, baseYTop); ctx.lineTo(cornerFar, corner);
+            ctx.moveTo(baseXLeft, minX); ctx.lineTo(corner, corner);
+            ctx.moveTo(baseXLeft, maxX); ctx.lineTo(corner, cornerFar);
+            ctx.moveTo(baseXRight, minX); ctx.lineTo(cornerFar, corner);
+            ctx.moveTo(baseXRight, maxX); ctx.lineTo(cornerFar, cornerFar);
             ctx.stroke();
 
             let cx = BOARD_SIZE / 2, cy = BOARD_SIZE / 2;
-            ctx.beginPath(); ctx.arc(cx, cy, 80, 0, Math.PI * 2); ctx.stroke();
-            ctx.beginPath(); ctx.arc(cx, cy, 10, 0, Math.PI * 2); ctx.fillStyle = '#e53935'; ctx.fill(); ctx.stroke();
-            
-            ctx.beginPath(); ctx.arc(cx, cy, 95, 0, Math.PI * 2); ctx.lineWidth = 1; ctx.stroke(); ctx.lineWidth = 3;
+            const centerDotRadius = 8;
+            const queenCircleInner = 70;
+            const queenCircleOuter = 88;
+            ctx.strokeStyle = '#b71c1c';
+            ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.arc(cx, cy, queenCircleInner, 0, Math.PI * 2); ctx.stroke();
+            ctx.beginPath(); ctx.arc(cx, cy, queenCircleOuter, 0, Math.PI * 2); ctx.stroke();
+            ctx.fillStyle = '#e53935';
+            ctx.beginPath(); ctx.arc(cx, cy, centerDotRadius, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#3e2723';
+            ctx.lineWidth = 3;
 
-            const drawBaseline = (x, y, w, h) => {
+            const baselineHalfH = 15;
+            const redMarkerRadius = 18;
+            const drawBaselineH = (x, y, w, h) => {
                 ctx.strokeRect(x, y, w, h);
-                ctx.beginPath(); ctx.arc(x, y + h/2, 20, 0, Math.PI*2); ctx.fillStyle = '#e53935'; ctx.fill(); ctx.stroke();
-                ctx.beginPath(); ctx.arc(x + w, y + h/2, 20, 0, Math.PI*2); ctx.fillStyle = '#e53935'; ctx.fill(); ctx.stroke();
+                ctx.fillStyle = '#e53935';
+                ctx.strokeStyle = '#b71c1c';
+                ctx.lineWidth = 1;
+                ctx.beginPath(); ctx.arc(x, y + h / 2, redMarkerRadius, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+                ctx.beginPath(); ctx.arc(x + w, y + h / 2, redMarkerRadius, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+                ctx.strokeStyle = '#3e2723';
+                ctx.lineWidth = 3;
+            };
+            const drawBaselineV = (x, y, w, h) => {
+                ctx.strokeRect(x, y, w, h);
+                ctx.fillStyle = '#e53935';
+                ctx.strokeStyle = '#b71c1c';
+                ctx.lineWidth = 1;
+                ctx.beginPath(); ctx.arc(x + w / 2, y, redMarkerRadius, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+                ctx.beginPath(); ctx.arc(x + w / 2, y + h, redMarkerRadius, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+                ctx.strokeStyle = '#3e2723';
+                ctx.lineWidth = 3;
             };
 
-            drawBaseline(230, baselines.bottom.y - 15, BOARD_SIZE - 460, 30);
-            drawBaseline(230, baselines.top.y - 15, BOARD_SIZE - 460, 30);
-            drawBaseline(180 - 15, 230, 30, BOARD_SIZE - 460);
-            drawBaseline(BOARD_SIZE - 180 - 15, 230, 30, BOARD_SIZE - 460);
+            drawBaselineH(minX, baseYBottom - baselineHalfH, maxX - minX, 30);
+            drawBaselineH(minX, baseYTop - baselineHalfH, maxX - minX, 30);
+            drawBaselineV(baseXLeft - baselineHalfH, minX, 30, maxX - minX);
+            drawBaselineV(baseXRight - baselineHalfH, minX, 30, maxX - minX);
 
             ctx.fillStyle = '#111';
             const pockets = [
@@ -469,7 +597,7 @@
         }
 
         function drawAimLine() {
-            if (state === 'AIMING' && dragStart && dragCurrent) {
+            if (state === 'AIMING' && dragStart && dragCurrent && strikerBody) {
                 let dx = dragCurrent.x - dragStart.x;
                 let dy = dragCurrent.y - dragStart.y;
                 let dragMag = Math.sqrt(dx*dx + dy*dy);
@@ -512,9 +640,7 @@
             
             const bodies = Composite.allBodies(engine.world);
             for (let b of bodies) {
-                if (['White', 'Black', 'Red', 'Striker'].includes(b.renderType)) {
-                    drawEntity(b);
-                }
+                if (isGamePiece(b)) drawEntity(b);
             }
             
             drawAimLine();
@@ -522,11 +648,9 @@
             if (state === 'MOVING') {
                 let isMoving = false;
                 for (let b of bodies) {
-                    if (['White', 'Black', 'Red', 'Striker'].includes(b.renderType)) {
-                        if (b.speed > 0.05) {
-                            isMoving = true;
-                            break;
-                        }
+                    if (isGamePiece(b) && b.speed > SPEED_THRESHOLD) {
+                        isMoving = true;
+                        break;
                     }
                 }
 
@@ -542,12 +666,23 @@
         // --- Input Handling ---
         function getMousePos(e) {
             let rect = canvas.getBoundingClientRect();
-            let clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            let clientY = e.touches ? e.touches[0].clientY : e.clientY;
-            
+            let clientX, clientY;
+            if (e.touches) {
+                if (e.touches.length > 0) {
+                    clientX = e.touches[0].clientX;
+                    clientY = e.touches[0].clientY;
+                } else if (e.changedTouches && e.changedTouches.length > 0) {
+                    clientX = e.changedTouches[0].clientX;
+                    clientY = e.changedTouches[0].clientY;
+                } else {
+                    return { x: 0, y: 0 };
+                }
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
             let scaleX = canvas.width / rect.width;
             let scaleY = canvas.height / rect.height;
-
             return {
                 x: (clientX - rect.left) * scaleX,
                 y: (clientY - rect.top) * scaleY
@@ -565,13 +700,13 @@
             let pos = getMousePos(e);
             let distToStriker = Math.hypot(pos.x - strikerBody.position.x, pos.y - strikerBody.position.y);
 
-            if (distToStriker <= STRIKER_RADIUS + 20) {
+            if (distToStriker <= STRIKER_RADIUS + STRIKER_HIT_MARGIN) {
                 state = 'AIMING';
                 dragStart = pos;
                 dragCurrent = pos;
             } else {
-                let baseline = turn === 'White' ? baselines.bottom : baselines.top;
-                if (Math.abs(pos.y - baseline.y) < 50) {
+                let baseline = getBaseline();
+                if (Math.abs(pos.y - baseline.y) < BASELINE_HIT_AREA) {
                     state = 'PLACING';
                     let newX = Math.max(baseline.minX, Math.min(baseline.maxX, pos.x));
                     Body.setPosition(strikerBody, { x: newX, y: baseline.y });
@@ -589,7 +724,7 @@
             if (state === 'AIMING') {
                 dragCurrent = pos;
             } else if (state === 'PLACING' && strikerBody) {
-                let baseline = turn === 'White' ? baselines.bottom : baselines.top;
+                let baseline = getBaseline();
                 let newX = Math.max(baseline.minX, Math.min(baseline.maxX, pos.x));
                 Body.setPosition(strikerBody, { x: newX, y: baseline.y });
             }
@@ -604,7 +739,7 @@
                 let dy = dragCurrent.y - dragStart.y;
                 let dist = Math.hypot(dx, dy);
                 
-                if (dist > 10) { 
+                if (dist > MIN_DRAG_TO_SHOOT) { 
                     let forceMag = Math.min(dist, MAX_PULL_DIST) * FORCE_MULTIPLIER;
                     let dirX = -dx / dist;
                     let dirY = -dy / dist;
@@ -634,6 +769,8 @@
         canvas.addEventListener('touchstart', onDown, {passive: false});
         canvas.addEventListener('touchmove', onMove, {passive: false});
         window.addEventListener('touchend', onUp, {passive: false});
+        canvas.addEventListener('touchcancel', onUp, {passive: false});
+        window.addEventListener('touchcancel', onUp, {passive: false});
 
         document.getElementById('reset-btn').addEventListener('click', () => {
             scores = { White: 0, Black: 0, Red: 0 };
@@ -651,16 +788,18 @@
         // Listen for power changes
         powerInput.addEventListener('input', (e) => {
             let val = parseFloat(e.target.value);
-            if (isNaN(val) || val <= 0) val = 1; // Minimum safeguard
-            
-            // Map the UI value (e.g., 4) to the physics engine multiplier (0.0004)
-            FORCE_MULTIPLIER = val * 0.0001; 
+            if (isNaN(val) || val <= 0) val = 1;
+            val = Math.max(1, Math.min(1000, val));
+            FORCE_MULTIPLIER = val * 0.0001;
         });
 
-        // Initialize and start loop
-        initEngine();
-        initBoard();
-        render(); 
+        // Initialize and start loop (only if canvas context is available)
+        if (ctx) {
+            initEngine();
+            initBoard();
+            render();
+        }
+        }
 
     </script>
 </body>
